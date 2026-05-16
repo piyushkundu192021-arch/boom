@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GhostChat</title>
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#1e1e1e">
+  <!-- Paho MQTT Client for free public signaling -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #121212; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; }
+    header { background: #1e1e1e; padding: 15px; text-align: center; font-weight: bold; border-bottom: 1px solid #333; }
+    #status { font-size: 12px; color: #ffab00; margin-top: 5px; }
+    #setup-screen, #chat-screen { display: flex; flex-direction: column; flex: 1; padding: 20px; justify-content: center; }
+    #chat-screen { display: none; padding: 10px; }
+    input, button { background: #2a2a2a; border: 1px solid #444; color: #fff; padding: 12px; margin: 8px 0; border-radius: 8px; font-size: 16px; width: 100%; }
+    button { background: #00e676; color: #000; font-weight: bold; cursor: pointer; border: none; }
+    button:disabled { background: #555; color: #888; }
+    #messages { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+    .msg { max-width: 75%; padding: 10px 14px; border-radius: 16px; font-size: 15px; word-break: break-word; }
+    .msg.me { background: #00e676; color: #000; align-self: flex-end; border-bottom-right-radius: 2px; }
+    .msg.them { background: #2a2a2a; color: #fff; align-self: flex-start; border-bottom-left-radius: 2px; }
+    #input-area { display: flex; gap: 8px; background: #1e1e1e; padding: 10px; }
+    #input-area input { margin: 0; }
+    #input-area button { width: auto; padding: 0 20px; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div>GhostChat 🔒</div>
+    <div id="status">Initializing...</div>
+  </header>
+
+  <!-- Setup Screen -->
+  <div id="setup-screen">
+    <p style="text-align:center; margin-bottom:20px; color:#aaa;">Choose a shared Room ID and a Secret Password with your partner. Keep them private!</p>
+    <input type="text" id="room-input" placeholder="Shared Room ID (e.g., my-secret-room-123)">
+    <input type="password" id="crypto-input" placeholder="Shared Encryption Key">
+    <button id="connect-btn" onclick="startApp()">Secure Connect</button>
+  </div>
+
+  <!-- Chat Screen -->
+  <div id="chat-screen">
+    <div id="messages"></div>
+    <div id="input-area">
+      <input type="text" id="text-input" placeholder="Type an E2EE message..." onkeypress="if(event.key==='Enter') sendMsg()">
+      <button onclick="sendMsg()">Send</button>
+    </div>
+  </div>
+
+  <script>
+    // Service Worker Registration
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').catch(console.error);
+    }
+
+    let room, cryptoKey, mqttClient, pc, dataChannel;
+    const myId = Math.random().toString(36).substring(2, 9);
+    
+    const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+    
+    const statusEl = document.getElementById('status');
+    const msgContainer = document.getElementById('messages');
+
+    // 1. Derive Crypto Key from User Password using PBKDF2
+    async function deriveKey(password) {
+      const enc = new TextEncoder();
+      const baseKey = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+      return crypto.subtle.deriveKey(
+        { name: "PBKDF2", salt: enc.encode("ghostchat_salt_fixed"), iterations: 100000, hash: "SHA-256" },
+        baseKey,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["encrypt", "decrypt"]
+      );
+    }
+
+    // 2. Encryption & Decryption
+    async function encryptData(text) {
+      const enc = new TextEncoder();
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, cryptoKey, enc.encode(text));
+      // Package IV and Ciphertext together
+      const payload = new Uint8Array(iv.length + encrypted.byteLength);
+      payload.set(iv);
+      payload.set(new Uint8Array(encrypted), iv.length);
+      return btoa(String.fromCharCode.apply(null, payload));
+    }
+
+    async function decryptData(base64Str) {
+      const raw = Uint8Array.from(atob(base64Str), c => c.charCodeAt(0));
+      const iv = raw.slice(0, 12);
+      const ciphertext = raw.slice(12);
+      const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, cryptoKey, ciphertext);
+      return new TextDecoder().decode(decrypted);
+    }
+
+    // 3. App Initialization
+    async function startApp() {
+      room = document.getElementById('room-input').value.trim();
+      const password = document.getElementById('crypto-input').value;
+
+      if (!room || !password) return alert("Please enter both Room ID and Secret Key.");
+
+      statusEl.innerText = "Deriving secure keys...";
+      cryptoKey = await deriveKey(password);
+
+      document.getElementById('setup-screen').style.display = 'none';
+      document.getElementById('chat-screen').style.display = 'flex';
+
+      initSignaling();
+    }
+
+    // 4. Signaling over Public MQTT via WebSockets
+    function initSignaling() {
+      statusEl.innerText = "Connecting to handshake network...";
+      // Using HiveMQ's public free broker websocket endpoint
+      mqttClient = new Paho.MQTT.Client("broker.hivemq.com", Number(8000), "ghost_" + myId);
+
+      mqttClient.onConnectionLost = () => {
+        statusEl.innerText = "Handshake dropped. Reconnecting...";
+        setTimeout(initSignaling, 2000);
+      };
+
+      mqttClient.onMessageArrived = async (msg) => {
+        const data = JSON.parse(msg.payloadString);
+        if (data.sender === myId) return; // Ignore own signaling actions
+
+        if (data.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          if (data.sdp.type === 'offer') {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            sendSignal({ sdp: pc.localDescription });
+          }
+        } else if (data.candidate) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch(e){}
+        }
+      };
+
+      mqttClient.connect({
+        onSuccess: () => {
+          statusEl.innerText = "Waiting for partner...";
+          mqttClient.subscribe("ghostchat/room/" + room);
+          setupWebRTC(true); // Initiate WebRTC peer instance
+        },
+        useSSL: false // Set to true if broker supports port 8884 wss
+      });
+    }
+
+    function sendSignal(payload) {
+      payload.sender = myId;
+      const message = new Paho.MQTT.Message(JSON.stringify(payload));
+      message.destinationName = "ghostchat/room/" + room;
+      mqttClient.send(message);
+    }
+
+    // 5. WebRTC Setup Engine
+    function setupWebRTC(isInitiator) {
+      pc = new RTCPeerConnection(rtcConfig);
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) sendSignal({ candidate: e.candidate });
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') {
+          statusEl.innerText = "🔒 Secure P2P Connected";
+          statusEl.style.color = "#00e676";
+          // Disconnect from MQTT Signaling once WebRTC P2P channel is secured!
+          mqttClient.disconnect(); 
+        } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+          statusEl.innerText = "Lost peer connection. Re-negotiating...";
+          statusEl.style.color = "#ffab00";
+          initSignaling(); // Auto-restart handshake logic seamlessly
+        }
+      };
+
+      if (isInitiator) {
+        // Create Outbound Data Channel
+        dataChannel = pc.createDataChannel("chat", { negotiated: true, id: 0 });
+        setupDataChannel();
+        
+        // Dynamic handshake trigger loop
+        pc.createOffer().then(offer => pc.setLocalDescription(offer)).then(() => {
+          sendSignal({ sdp: pc.localDescription });
+        });
+      } else {
+        // Catch Inbound Data Channel
+        dataChannel = pc.createDataChannel("chat", { negotiated: true, id: 0 });
+        setupDataChannel();
+      }
+    }
+
+    function setupDataChannel() {
+      dataChannel.onmessage = async (e) => {
+        try {
+          const decrypted = await decryptData(e.data);
+          appendMessage(decrypted, 'them');
+        } catch (err) {
+          appendMessage("[Decryption Error: Keys mismatch or data tampered]", 'them');
+        }
+      };
+    }
+
+    // 6. UI Actions & Messaging
+    async function sendMsg() {
+      const input = document.getElementById('text-input');
+      const text = input.value.trim();
+      if (!text || !dataChannel || dataChannel.readyState !== 'open') return;
+
+      appendMessage(text, 'me');
+      input.value = '';
+
+      const encrypted = await encryptData(text);
+      dataChannel.send(encrypted);
+    }
+
+    function appendMessage(text, side) {
+      const div = document.createElement('div');
+      div.classList.add('msg', side);
+      div.innerText = text;
+      msgContainer.appendChild(div);
+      msgContainer.scrollTop = msgContainer.scrollHeight;
+    }
+  </script>
+</body>
+</html>
